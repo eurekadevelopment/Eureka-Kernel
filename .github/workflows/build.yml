@@ -1,0 +1,432 @@
+name: Build Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_variant:
+        description: 'Android Variant'
+        required: true
+        default: 'aosp_legacy'
+        type: choice
+        options:
+        - aosp_legacy
+        - oneui3
+      selinux_mode:
+        description: 'SELinux Mode'
+        required: true
+        default: 'enforcing'
+        type: choice
+        options:
+        - enforcing
+        - permissive
+      device_model:
+        description: 'Device Model'
+        required: true
+        default: 'A105'
+        type: choice
+        options:
+        - A105
+        - A205
+        - A202
+        - A305
+        - A307
+        - A405
+        - A3050
+        - M205
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "2G"
+      CCACHE_HARDLINK: "true"
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+        fetch-depth: 100
+
+    - name: Initialize submodules
+      run: |
+        git submodule update --init --recursive
+        
+    - name: Setup KernelSU-Next
+      run: |
+        # Remove existing KernelSU setup
+        rm -rf KernelSU-Next
+        rm -rf KernelSU
+        rm -rf drivers/kernelsu
+        # Install latest KernelSU-Next 1.0.9
+        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s v1.0.9
+        # Verify installation
+        ls -la drivers/kernelsu/
+        ls -la drivers/kernelsu/Kconfig || echo "Kconfig not found"
+
+    - name: Cache proton-clang
+      uses: actions/cache@v3
+      id: cache-proton
+      with:
+        path: proton-clang
+        key: proton-clang-${{ runner.os }}-${{ hashFiles('**/build-kernel.yml') }}
+        restore-keys: |
+          proton-clang-${{ runner.os }}-
+
+    - name: Cache APT packages
+      uses: actions/cache@v3
+      with:
+        path: /var/cache/apt/archives
+        key: apt-cache-${{ runner.os }}-${{ hashFiles('**/build-kernel.yml') }}
+        restore-keys: |
+          apt-cache-${{ runner.os }}-
+
+    - name: Set up ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+
+    - name: Install dependencies and setup toolchain
+      run: |
+        # Install dependencies exactly like build.sh
+        if [ -f "/etc/apt/sources.list.d/ubuntu.sources" ]; then
+          sudo cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources~
+          sudo sed -Ei 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+        else
+          sudo cp /etc/apt/sources.list /etc/apt/sources.list~
+          sudo sed -Ei 's/^# deb-src /deb-src /' /etc/apt/sources.list
+        fi
+        sudo apt-get update -y
+        sudo apt install -y \
+        gcc-aarch64-linux-gnu \
+        gcc-arm-linux-gnueabi \
+        binutils make python3 python2 libssl-dev build-essential \
+        bc bison flex unzip ca-certificates xz-utils \
+        mkbootimg cpio device-tree-compiler git git-lfs
+        
+        # Setup toolchain directory structure like build.sh expects
+        if [ "${{ steps.cache-proton.outputs.cache-hit }}" != 'true' ]; then
+          echo "Cache for proton-clang missed. Cloning..."
+          rm -rf proton-clang
+          git clone https://github.com/kdrag0n/proton-clang --depth=1 -b master
+        else
+          echo "Cache for proton-clang hit. Skipping clone."
+        fi
+        
+        # Create toolchain symlink like build.sh expects
+        ln -sf proton-clang toolchain
+
+    - name: 'Patch KernelSU manual scope-minimized hooks into the kernel source'
+      working-directory: '/home/runner/work/Eureka-Kernel/Eureka-Kernel/'
+      run: |
+        # Install coccinelle dependencies
+        sudo apt-get build-dep -y coccinelle
+        
+        # Clone and install coccinelle from source
+        git clone --depth=1 https://github.com/coccinelle/coccinelle.git
+        cd ./coccinelle/
+        ./autogen
+        ./configure
+        make -j$(nproc --all)
+        sudo make -j$(nproc --all) install
+        cd .. # Return to root directory
+        
+        # Clone the repository which contains the patch
+        git clone --depth=1 https://github.com/devnoname120/kernelsu-coccinelle.git
+        
+        # Patch the kernel source with scope-minimized hooks
+        for p in fs drivers/input drivers/tty arch/arm/kernel; do 
+          spatch --sp-file ./kernelsu-coccinelle/scope-minimized-hooks/kernelsu-scope-minimized.cocci --in-place --linux-spacing "$p"
+        done
+        
+        # Cleanup
+        rm -rf ./kernelsu-coccinelle/
+        # Delete files that may conflict with kernel functionality
+        rm -rf ./android/abi_gki_protected_exports*
+        
+        # Run make clean/mrproper here, AFTER all patches have been applied
+        make clean
+        make mrproper
+
+    - name: Configure Android Variant and SELinux
+      run: |
+        echo "Configuring for Android variant: ${{ github.event.inputs.android_variant }}"
+        echo "SELinux mode: ${{ github.event.inputs.selinux_mode }}"
+        echo "Device: ${{ github.event.inputs.device_model }}"
+        
+        # Set device-specific variables like build.sh
+        case "${{ github.event.inputs.device_model }}" in
+          "A105")
+            export CODENAME=A105
+            export KERNEL_DEFCONFIG=exynos7885-a10_defconfig
+            ;;
+          "A205")
+            export CODENAME=A205
+            export KERNEL_DEFCONFIG=exynos7885-a20_defconfig
+            ;;
+          "A202")
+            export CODENAME=A202
+            export KERNEL_DEFCONFIG=exynos7885-a20e_defconfig
+            ;;
+          "A305")
+            export CODENAME=A305
+            export KERNEL_DEFCONFIG=exynos7885-a30_defconfig
+            ;;
+          "A307")
+            export CODENAME=A307
+            export KERNEL_DEFCONFIG=exynos7885-a30s_defconfig
+            ;;
+          "A405")
+            export CODENAME=A405
+            export KERNEL_DEFCONFIG=exynos7885-a40_defconfig
+            ;;
+          "A3050")
+            export CODENAME=A3050
+            export KERNEL_DEFCONFIG=exynos7885-a40s_defconfig
+            ;;
+          "M205")
+            export CODENAME=M205
+            if [ "${{ github.event.inputs.selinux_mode }}" == "enforcing" ]; then
+              export KERNEL_DEFCONFIG=exynos7885-m20_enforcing_defconfig
+            else
+              export KERNEL_DEFCONFIG=exynos7885-m20_permissive_defconfig
+            fi
+            ;;
+        esac
+        
+        # Backup DTS files if they don't exist
+        if [ ! -e "arch/arm64/boot/dts/exynos/dtb/exynos7885.dts.bak" ]; then
+          cp arch/arm64/boot/dts/exynos/dtb/exynos7885.dts arch/arm64/boot/dts/exynos/dtb/exynos7885.dts.bak
+        fi
+        
+        if [ ! -e "drivers/media/platform/exynos/Kconfig.bak" ]; then
+          cp drivers/media/platform/exynos/Kconfig drivers/media/platform/exynos/Kconfig.bak
+        fi
+        
+        # Configure SELinux exactly like build.sh
+        LINE=$(grep -n 'sel_boot_state' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts | gawk '{print $1}' FS=":")
+        if [ "${{ github.event.inputs.selinux_mode }}" == "enforcing" ]; then
+          sed -i ${LINE}'s/.*/		sel_boot_state = <0>;/' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts
+          export SELINUX_STATUS="enforcing_"
+        else
+          sed -i ${LINE}'s/.*/		sel_boot_state = <1>;/' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts
+          export SELINUX_STATUS="permissive_"
+        fi
+        
+        # Configure Android variant exactly like build.sh
+        LINE_VARIANT=$(grep -n 'eureka_kernel_variant' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts | gawk '{print $1}' FS=":")
+        if [ "${{ github.event.inputs.android_variant }}" == "oneui3" ]; then
+          # OneUI 3 configuration (variant 3)
+          sed -i ${LINE_VARIANT}'s/.*/			eureka_kernel_variant = <3>;/' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts
+          sed -i '55s/.*/        default y/' drivers/media/platform/exynos/Kconfig
+          export ONEUI3=1
+          export ANDROID_VAR="OneUI3"
+          export ANDROID=r
+          export AND_VER=11
+        else
+          # AOSP Legacy configuration (variant 2)
+          sed -i ${LINE_VARIANT}'s/.*/			eureka_kernel_variant = <2>;/' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts
+          export ONEUI3=0
+          export ANDROID_VAR="AOSP-Legacy"
+          export ANDROID=r
+          export AND_VER=11
+        fi
+        
+        # Export variables to GITHUB_ENV for next steps
+        echo "CODENAME=${CODENAME}" >> $GITHUB_ENV
+        echo "KERNEL_DEFCONFIG=${KERNEL_DEFCONFIG}" >> $GITHUB_ENV
+        echo "SELINUX_STATUS=${SELINUX_STATUS}" >> $GITHUB_ENV
+        echo "ONEUI3=${ONEUI3}" >> $GITHUB_ENV  
+        echo "ANDROID_VAR=${ANDROID_VAR}" >> $GITHUB_ENV
+        echo "ANDROID=${ANDROID}" >> $GITHUB_ENV
+        echo "AND_VER=${AND_VER}" >> $GITHUB_ENV
+
+    - name: Build Kernel
+      run: |
+        # Set all variables exactly like build.sh
+        export ROOT_DIR=$(pwd)
+        export KERNEL_DIR=$ROOT_DIR
+        export ARCH=arm64
+        export SUBARCH=arm64
+        
+        # Toolchain paths exactly like build.sh
+        export GCC_ARM64_FILE=aarch64-linux-gnu-
+        export GCC_ARM32_FILE=arm-linux-gnueabi-
+        export CROSS_COMPILE=$(pwd)/toolchain/bin/$GCC_ARM64_FILE
+        export CROSS_COMPILE_ARM32=$(pwd)/toolchain/bin/$GCC_ARM32_FILE
+        
+        # Build variables like build.sh
+        export KBUILD_BUILD_USER=Eureka
+        export KBUILD_BUILD_HOST=Eureka.org
+        
+        # Android version variables
+        export ANDROID_MAJOR_VERSION=${{ env.ANDROID }}
+        export PLATFORM_VERSION=${{ env.AND_VER }}
+        
+        # Clang setup like build.sh
+        export PATH="$KERNEL_DIR/toolchain/bin:${PATH}"
+        export LD_LIBRARY_PATH="$KERNEL_DIR/toolchain/lib:$LD_LIBRARY_PATH"
+        export CC=clang
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        
+        # Additional clang tools
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export OBJDUMP=llvm-objdump
+        export OBJCOPY=llvm-objcopy
+        export STRIP=llvm-strip
+        export KCFLAGS=-w
+        
+        # Create localversion for proper naming (keep short)
+        REV=${{ github.run_number }}
+        
+        if [ "${{ env.ONEUI3 }}" == "1" ]; then
+          export LOCALVERSION=-EurekaR${REV}_${{ env.CODENAME }}_S
+        else
+          export LOCALVERSION=-EurekaR${REV}_${{ env.CODENAME }}_QRS
+        fi
+        
+        echo "Building with defconfig: ${{ env.KERNEL_DEFCONFIG }}"
+        echo "ANDROID_MAJOR_VERSION: ${{ env.ANDROID }}"
+        echo "PLATFORM_VERSION: ${{ env.AND_VER }}"
+        echo "LOCALVERSION: ${LOCALVERSION}"
+        
+        # Make defconfig exactly like build.sh
+        make O=out ARCH=arm64 ANDROID_MAJOR_VERSION=${{ env.ANDROID }} ${{ env.KERNEL_DEFCONFIG }}
+
+        # Apply KernelSU configs
+        scripts/config --file out/.config -d LTO -d LTO_CLANG -d CFI_CLANG
+        scripts/config --file out/.config -e KSU -e KSU_DEBUG -e KSU_SU_DEBUG -e KSU_MANUAL_HOOK -e KSU_64BIT
+        scripts/config --file out/.config -e CONFIG_KSU_LSM_SECURITY_HOOKS -e CONFIG_KALLSYMS -e CONFIG_KALLSYMS_ALL
+        scripts/config --file out/.config -d KPROBES -d KPROBE_EVENTS -d KSU_KPROBES_HOOK
+        scripts/config --file out/.config -e MODULE_FORCE_UNLOAD -e MODULE_FORCE_LOAD
+        
+        make O=out olddefconfig
+        
+        # Build exactly like build.sh
+        PATH="$KERNEL_DIR/toolchain/bin:${PATH}" \
+          make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          ANDROID_MAJOR_VERSION=${{ env.ANDROID }} \
+          LLVM_DIS=llvm-dis AR=llvm-ar NM=llvm-nm LD=ld.lld OBJDUMP=llvm-objdump STRIP=llvm-strip \
+          CC=clang \
+          LD_LIBRARY_PATH="$KERNEL_DIR/toolchain/lib:$LD_LIBRARY_PATH" \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=$GCC_ARM64_FILE \
+          CROSS_COMPILE_ARM32=$GCC_ARM32_FILE
+          
+        # Copy files exactly like build.sh
+        if [ -f "out/arch/arm64/boot/Image" ]; then
+          cp -f out/arch/arm64/boot/Image arch/arm64/boot/Image
+        fi
+        
+        if [ -f "out/arch/arm64/boot/dtb.img" ]; then
+          cp -f out/arch/arm64/boot/dtb.img arch/arm64/boot/dtb.img
+        fi
+        
+        if [ -f "out/arch/arm64/boot/dtbo.img" ]; then
+          cp -f out/arch/arm64/boot/dtbo.img arch/arm64/boot/dtbo.img
+        fi
+
+    - name: Package kernel
+      run: |
+        cd kernel_zip/anykernel/
+        echo "Packaging and preparing for upload..."
+        
+        # Generate proper zip name based on variant
+        REV=${{ github.run_number }}
+        
+        if [ "${{ env.ONEUI3 }}" == "1" ]; then
+          ZIPNAME="Eureka_R${REV}_${{ env.CODENAME }}_${{ github.event.inputs.selinux_mode }}_S_KSUN.zip"
+        else
+          ZIPNAME="Eureka_R${REV}_${{ env.CODENAME }}_${{ github.event.inputs.selinux_mode }}_Legacy_QRS_KSUN.zip"
+        fi
+        
+        # Copy built kernel artifacts exactly like build.sh ZIPPIFY function
+        if [ -f "../../arch/arm64/boot/Image" ]; then
+          cp -f ../../arch/arm64/boot/Image Image
+          echo "✅ Copied Image"
+        else
+          echo "❌ Image not found!"
+          exit 1
+        fi
+        
+        # Copy DTB if it exists
+        if [ -f "../../arch/arm64/boot/dtb.img" ]; then
+          if [ "${{ env.CODENAME }}" == "A3050" ] || [ "${{ env.CODENAME }}" == "M205" ]; then
+            # Don't copy dtb to anykernel directory for these devices (like build.sh)
+            cp -f ../../arch/arm64/boot/dtb.img ../${{ env.CODENAME }}_dtb.img
+          else
+            cp -f ../../arch/arm64/boot/dtb.img dtb.img
+            echo "✅ Copied dtb.img"
+          fi
+        fi
+        
+        # Use prebuilt DTBO like build.sh PREBUILT_DTBO function
+        case "${{ env.CODENAME }}" in
+          "A105") cp -f ../dtbo/a10/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied A10 DTBO" || echo "⚠️ A10 DTBO not found" ;;
+          "A205") cp -f ../dtbo/a20/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied A20 DTBO" || echo "⚠️ A20 DTBO not found" ;;
+          "A202") cp -f ../dtbo/a20e/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied A20E DTBO" || echo "⚠️ A20E DTBO not found" ;;
+          "A305") cp -f ../dtbo/a30/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied A30 DTBO" || echo "⚠️ A30 DTBO not found" ;;
+          "A307") cp -f ../dtbo/a30s/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied A30S DTBO" || echo "⚠️ A30S DTBO not found" ;;
+          "A405") cp -f ../dtbo/a40/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied A40 DTBO" || echo "⚠️ A40 DTBO not found" ;;
+          "A3050") cp -f ../dtbo/a3050/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied A40S DTBO" || echo "⚠️ A40S DTBO not found" ;;
+          "M205") cp -f ../dtbo/m20/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied M20 DTBO" || echo "⚠️ M20 DTBO not found" ;;
+        esac
+
+        # Create zip exactly like build.sh ZIPPIFY function
+        if [ -e "dtb.img" ]; then
+          if [ -e "dtbo.img" ]; then
+            zip -r9 $ZIPNAME META-INF tools anykernel.sh Image dtb.img dtbo.img version > /dev/null
+            echo "✅ Created zip with Image + DTB + DTBO"
+          else
+            mv anykernel.sh anykernel.sh.bak
+            sed '58,61d' anykernel.sh.bak > anykernel.sh
+            zip -r9 $ZIPNAME META-INF tools anykernel.sh Image dtb.img version > /dev/null
+            rm -f anykernel.sh
+            mv anykernel.sh.bak anykernel.sh
+            chmod a+x anykernel.sh
+            echo "✅ Created zip with Image + DTB (no DTBO)"
+          fi
+        else
+          mv anykernel.sh anykernel.sh.bak
+          sed '53,61d' anykernel.sh.bak > anykernel.sh
+          zip -r9 $ZIPNAME META-INF tools anykernel.sh Image version > /dev/null
+          rm -f anykernel.sh
+          mv anykernel.sh.bak anykernel.sh
+          echo "✅ Created zip with Image only"
+        fi
+        
+        chmod 0777 $ZIPNAME
+        echo "ZIPNAME=${ZIPNAME}" >> $GITHUB_ENV
+        
+        # Go back to the root directory
+        cd ../../
+
+    - name: Upload kernel to artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ANDROID_VAR }}-${{ env.CODENAME }}-${{ github.event.inputs.selinux_mode }}-R${{ github.run_number }}
+        path: kernel_zip/anykernel/*.zip
+        if-no-files-found: error
+
+    - name: Generate Build Summary
+      run: |
+        echo "## 🚀 Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Device Model:** ${{ env.CODENAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Android Variant:** ${{ env.ANDROID_VAR }}" >> $GITHUB_STEP_SUMMARY  
+        echo "**SELinux Mode:** ${{ github.event.inputs.selinux_mode }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Kernel Version:** Eureka R${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Defconfig:** ${{ env.KERNEL_DEFCONFIG }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Build Status:** ✅ Success" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Features:**" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ KernelSU-Next v1.0.9" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Scope-minimized hooks" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ env.ONEUI3 }}" == "1" ]; then
+          echo "- ✅ OneUI version" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- ✅ AOSP version" >> $GITHUB_STEP_SUMMARY
+        fi
