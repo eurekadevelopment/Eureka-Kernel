@@ -1,0 +1,212 @@
+name: Build Kernel (Matrix Compile Test)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    strategy:
+      # fail-fast: false ensures that if one device build fails, the others will continue to run.
+      fail-fast: false
+      matrix:
+        # A job will be created for each device in this list.
+        device_model: [A105, A205, A202, A305, A307, A405, A3050, M205]
+
+    env:
+      # You can change the default variants for testing here
+      ANDROID_VARIANT: 'aosp_legacy'
+      SELINUX_MODE: 'permissive'
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_MAXSIZE: "2G"
+      CCACHE_HARDLINK: "true"
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+        fetch-depth: 100
+
+    - name: Initialize submodules
+      run: |
+        git submodule update --init --recursive
+        
+    - name: Setup KernelSU-Next
+      run: |
+        echo "Setting up KernelSU-Next..."
+        rm -rf KernelSU-Next KernelSU drivers/kernelsu
+        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s v1.0.9
+        ls -la drivers/kernelsu/
+
+    - name: Cache proton-clang
+      uses: actions/cache@v3
+      id: cache-proton
+      with:
+        path: proton-clang
+        key: proton-clang-${{ runner.os }}-${{ hashFiles('**/build-kernel.yml') }}
+
+    - name: Set up ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+
+    - name: Install dependencies and setup toolchain
+      run: |
+        echo "Installing dependencies..."
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends \
+          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils make python3 \
+          libssl-dev build-essential bc bison flex unzip ca-certificates \
+          xz-utils mkbootimg cpio device-tree-compiler git git-lfs gawk
+        
+        echo "Setting up toolchain..."
+        if [ "${{ steps.cache-proton.outputs.cache-hit }}" != 'true' ]; then
+          echo "Cache for proton-clang missed. Cloning..."
+          git clone https://github.com/kdrag0n/proton-clang --depth=1 -b master
+        else
+          echo "Cache for proton-clang hit. Skipping clone."
+        fi
+        ln -sf proton-clang toolchain
+
+    - name: Apply Compilation Fix Patches
+      run: |
+        echo "🔧 Applying compilation fix patches..."
+        # Fix 1: include/asm-generic/pgtable.h
+        if [ -f "include/asm-generic/pgtable.h" ]; then
+          if ! grep -q "extern unsigned long uksm_zero_pfn __read_mostly;" include/asm-generic/pgtable.h; then
+            sed -i '/^#ifdef CONFIG_UKSM$/i\
+            extern unsigned long uksm_zero_pfn __read_mostly;\
+            extern unsigned long zero_pfn __read_mostly;' include/asm-generic/pgtable.h
+          fi
+          sed -i '/^\s*extern __read_mostly unsigned long uksm_zero_pfn;$/d' include/asm-generic/pgtable.h
+          sed -i '/^\s*extern unsigned long zero_pfn;$/d' include/asm-generic/pgtable.h
+          echo "✅ Fixed include/asm-generic/pgtable.h"
+        fi
+        # Fix 2: s6d7at0b_a10_lcd_ctrl.c
+        if [ -f "drivers/video/fbdev/exynos/dpu_7885/panels/s6d7at0b_a10_lcd_ctrl.c" ]; then
+          sed -i 's/int value = lcd->custom_brightness \* 1\.2;/int value = (lcd->custom_brightness * 12) \/ 10;/' \
+            drivers/video/fbdev/exynos/dpu_7885/panels/s6d7at0b_a10_lcd_ctrl.c
+          echo "✅ Fixed s6d7at0b_a10_lcd_ctrl.c brightness calculation"
+        fi
+        # Fix 3: decon_reg.c
+        if [ -f "drivers/video/fbdev/exynos/dpu_7885/decon_reg.c" ]; then
+          sed -i 's/const double decon_clocks_table\[\]\[CLK_ID_MAX\]/const long decon_clocks_table[][CLK_ID_MAX]/' \
+            drivers/video/fbdev/exynos/dpu_7885/decon_reg.c
+          echo "✅ Fixed decon_reg.c data type"
+        fi
+        echo "✅ All compilation fix patches applied successfully!"
+        
+    - name: Configure for ${{ matrix.device_model }}
+      run: |
+        echo "Configuring for Android variant: ${{ env.ANDROID_VARIANT }}"
+        echo "SELinux mode: ${{ env.SELINUX_MODE }}"
+        echo "Device: ${{ matrix.device_model }}"
+
+        # Set device-specific variables
+        case "${{ matrix.device_model }}" in
+          "A105")   KERNEL_DEFCONFIG=exynos7885-a10_defconfig ;;
+          "A205")   KERNEL_DEFCONFIG=exynos7885-a20_defconfig ;;
+          "A202")   KERNEL_DEFCONFIG=exynos7885-a20e_defconfig ;;
+          "A305")   KERNEL_DEFCONFIG=exynos7885-a30_defconfig ;;
+          "A307")   KERNEL_DEFCONFIG=exynos7885-a30s_defconfig ;;
+          "A405")   KERNEL_DEFCONFIG=exynos7885-a40_defconfig ;;
+          "A3050")  KERNEL_DEFCONFIG=exynos7885-a40s_defconfig ;;
+          "M205")
+            if [ "${{ env.SELINUX_MODE }}" == "enforcing" ]; then
+              KERNEL_DEFCONFIG=exynos7885-m20_enforcing_defconfig
+            else
+              KERNEL_DEFCONFIG=exynos7885-m20_permissive_defconfig
+            fi
+            ;;
+        esac
+
+        # Configure SELinux
+        LINE=$(grep -n 'sel_boot_state' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts | gawk '{print $1}' FS=":")
+        if [ "${{ env.SELINUX_MODE }}" == "enforcing" ]; then
+          sed -i ${LINE}'s/.*/\t\tsel_boot_state = <0>;/' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts
+        else
+          sed -i ${LINE}'s/.*/\t\tsel_boot_state = <1>;/' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts
+        fi
+
+        # Configure Android variant
+        LINE_VARIANT=$(grep -n 'eureka_kernel_variant' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts | gawk '{print $1}' FS=":")
+        if [ "${{ env.ANDROID_VARIANT }}" == "oneui3" ]; then
+          sed -i ${LINE_VARIANT}'s/.*/\t\t\teureka_kernel_variant = <3>;/' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts
+          echo "ONEUI3=1" >> $GITHUB_ENV
+          echo "ANDROID_VAR=OneUI3" >> $GITHUB_ENV
+        else
+          sed -i ${LINE_VARIANT}'s/.*/\t\t\teureka_kernel_variant = <2>;/' arch/arm64/boot/dts/exynos/dtb/exynos7885.dts
+          echo "ONEUI3=0" >> $GITHUB_ENV
+          echo "ANDROID_VAR=AOSP-Legacy" >> $GITHUB_ENV
+        fi
+
+        echo "KERNEL_DEFCONFIG=${KERNEL_DEFCONFIG}" >> $GITHUB_ENV
+        echo "CODENAME=${{ matrix.device_model }}" >> $GITHUB_ENV
+        echo "ANDROID=r" >> $GITHUB_ENV
+        echo "AND_VER=11" >> $GITHUB_ENV
+
+    - name: Building Kernel for ${{ matrix.device_model }}
+      run: |
+        # Set build environment
+        export KERNEL_DIR=$(pwd)
+        export ARCH=arm64
+        export CROSS_COMPILE=$(pwd)/toolchain/bin/aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=$(pwd)/toolchain/bin/arm-linux-gnueabi-
+        export KBUILD_BUILD_USER=GitHub-Actions
+        export KBUILD_BUILD_HOST=Matrix-Test
+        export PATH="$KERNEL_DIR/toolchain/bin:${PATH}"
+        export CC=clang
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        
+        if [ "${{ env.ONEUI3 }}" == "1" ]; then
+          export LOCALVERSION=-EurekaR${{ github.run_number }}_${{ env.CODENAME }}_S
+        else
+          export LOCALVERSION=-EurekaR${{ github.run_number }}_${{ env.CODENAME }}_QRS
+        fi
+        
+        echo "Building with defconfig: ${{ env.KERNEL_DEFCONFIG }}"
+        echo "LOCALVERSION: ${LOCALVERSION}"
+        
+        # Make defconfig
+        make O=out ARCH=arm64 ANDROID_MAJOR_VERSION=${{ env.ANDROID }} ${{ env.KERNEL_DEFCONFIG }}
+        
+        # Apply KSU configs and other critical configs
+        {
+          echo "CONFIG_KSU=y"
+          echo "CONFIG_KSU_MANUAL_HOOK=y"
+          echo "CONFIG_KSU_LSM_SECURITY_HOOKS=y"
+          echo "CONFIG_KALLSYMS=y"
+          echo "CONFIG_KALLSYMS_ALL=y"
+          echo "# CONFIG_KPROBES is not set"
+          echo "# CONFIG_LTO_CLANG is not set"
+          echo "# CONFIG_CFI_CLANG is not set"
+        } >> out/.config
+        
+        echo "--- Starting Kernel Compilation for ${{ env.CODENAME }} ---"
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          ANDROID_MAJOR_VERSION=${{ env.ANDROID }} \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          
+        if [ ! -f "out/arch/arm64/boot/Image" ]; then
+          echo "❌ Kernel compilation failed for ${{ env.CODENAME }}!"
+          exit 1
+        else
+          echo "✅ Kernel compiled successfully for ${{ env.CODENAME }}!"
+        fi
+
+    - name: Upload Build Artifacts for ${{ matrix.device_model }}
+      uses: actions/upload-artifact@v4
+      with:
+        # The artifact name will include the device model for easy identification
+        name: Compile-Result-${{ matrix.device_model }}
+        path: |
+          out/arch/arm64/boot/Image
+          out/arch/arm64/boot/dtb.img
+          out/arch/arm64/boot/dtbo.img
+          out/.config
+        if-no-files-found: error
