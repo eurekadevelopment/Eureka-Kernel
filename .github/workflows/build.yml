@@ -289,7 +289,7 @@ jobs:
         echo "ANDROID=${ANDROID}" >> $GITHUB_ENV
         echo "AND_VER=${AND_VER}" >> $GITHUB_ENV
 
-    - name: Build Kernel - Anti-Bootloop Method
+    - name: Building Kernel
       run: |
         # Set all variables exactly like build.sh
         export ROOT_DIR=$(pwd)
@@ -406,49 +406,81 @@ jobs:
           echo "DEBUG: All critical KernelSU configs verified. Continuing build."
         fi
 
-            ######################################################################
-            # ++ FINAL CONFIGURATION VERIFICATION STEP ++
-            ######################################################################
-            echo "✅ Verifying final .config before compilation..."
+            ############################################################################
+            # ++ COMPREHENSIVE FINAL CONFIGURATION VERIFICATION STEP ++
+            ############################################################################
+            echo "✅ Verifying ALL modified configs before compilation..."
             
             CONFIG_FILE="out/.config"
+            FAILED_CHECKS=0
+      
+            # Array of configs that MUST be enabled (=y)
+            ENABLED_CONFIGS=(
+                "CONFIG_DYNAMIC_DEBUG"
+                "CONFIG_PRINTK_TIME"
+                "CONFIG_KSU"
+                "CONFIG_KSU_MANUAL_HOOK"
+                "CONFIG_KSU_LSM_SECURITY_HOOKS"
+                "CONFIG_KSU_DEBUG"
+                "CONFIG_KSU_SU_DEBUG"
+                "CONFIG_KSU_64BIT"
+                "CONFIG_KALLSYMS"
+                "CONFIG_KALLSYMS_ALL"
+            )
+      
+            # Array of configs that MUST be disabled (must not be '=y')
+            DISABLED_CONFIGS=(
+                "CONFIG_KPROBES"
+                "CONFIG_HAVE_KPROBES"
+                "CONFIG_KPROBE_EVENTS"
+                "CONFIG_KSU_KPROBES_HOOK"
+                "CONFIG_LTO"
+                "CONFIG_LTO_CLANG"
+                "CONFIG_CFI_CLANG"
+            )
             
-            # Check 1: CONFIG_KPROBES MUST BE DISABLED
-            # If "CONFIG_KPROBES=y" is found, the build will fail.
-            if grep -q "CONFIG_KPROBES=y" "$CONFIG_FILE"; then
-              echo "❌ VERIFICATION FAILED: CONFIG_KPROBES is still enabled (CONFIG_KPROBES=y)!"
-              echo "   This is the primary cause of bootloops. Review the 'make olddefconfig' step."
-              # Display related lines for debugging
-              grep 'KPROBES' "$CONFIG_FILE"
-              exit 1
-            else
-              echo "   -> OK: CONFIG_KPROBES is disabled."
-            fi
+            echo "---"
+            echo "--- Checking required ENABLED configs ---"
+            for config in "${ENABLED_CONFIGS[@]}"; do
+                if ! grep -q "^${config}=y$" "$CONFIG_FILE"; then
+                    echo "❌ FAILED: ${config} is not set to 'y'!"
+                    FAILED_CHECKS=1
+                else
+                    echo "   -> OK: ${config}=y"
+                fi
+            done
+      
+            echo "--- Checking required DISABLED configs ---"
+            for config in "${DISABLED_CONFIGS[@]}"; do
+                if grep -q "^${config}=y$" "$CONFIG_FILE"; then
+                    echo "❌ FAILED: ${config} is enabled, but it should be disabled!"
+                    FAILED_CHECKS=1
+                else
+                    echo "   -> OK: ${config} is disabled."
+                fi
+            done
             
-            # Check 2: KernelSU and its manual hooks MUST BE ENABLED
-            # If "CONFIG_KSU=y" is not found, the build will fail.
-            if ! grep -q "CONFIG_KSU=y" "$CONFIG_FILE"; then
-              echo "❌ VERIFICATION FAILED: CONFIG_KSU is not enabled!"
-              exit 1
+            echo "--- Checking specific value configs ---"
+            # Check the specific value for CONFIG_LOG_BUF_SHIFT
+            if ! grep -q "^CONFIG_LOG_BUF_SHIFT=21$" "$CONFIG_FILE"; then
+                echo "❌ FAILED: CONFIG_LOG_BUF_SHIFT is not set to '21'!"
+                FAILED_CHECKS=1
             else
-              echo "   -> OK: CONFIG_KSU=y is enabled."
-            fi
-            
-            if ! grep -q "CONFIG_KSU_MANUAL_HOOK=y" "$CONFIG_FILE"; then
-              echo "❌ VERIFICATION FAILED: CONFIG_KSU_MANUAL_HOOK is not enabled!"
-              exit 1
-            else
-              echo "   -> OK: CONFIG_KSU_MANUAL_HOOK=y is enabled."
+                echo "   -> OK: CONFIG_LOG_BUF_SHIFT=21"
             fi
       
-            if ! grep -q "CONFIG_KSU_LSM_SECURITY_HOOKS=y" "$CONFIG_FILE"; then
-              echo "❌ VERIFICATION FAILED: CONFIG_KSU_LSM_SECURITY_HOOKS is not enabled!"
-              exit 1
+            # Check the final result
+            if [ "$FAILED_CHECKS" -eq 1 ]; then
+                echo "---"
+                echo "🔥 One or more configuration checks failed. Halting build."
+                echo "---"
+                exit 1
             else
-              echo "   -> OK: CONFIG_KSU_LSM_SECURITY_HOOKS=y is enabled."
+                echo "---"
+                echo "✅ All configurations verified successfully!"
+                echo "---"
             fi
-            
-            echo "✅ All critical configurations verified successfully!"
+            ############################################################################
         
         
         echo "DEBUG: Starting kernel compilation"
