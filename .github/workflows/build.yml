@@ -1,4 +1,4 @@
-name: Build Kernel
+name: Build Kernel - Anti-Bootloop
 
 on:
   workflow_dispatch:
@@ -103,7 +103,7 @@ jobs:
         gcc-arm-linux-gnueabi \
         binutils make python3 python2 libssl-dev build-essential \
         bc bison flex unzip ca-certificates xz-utils \
-        mkbootimg cpio device-tree-compiler git git-lfs
+        mkbootimg cpio device-tree-compiler git git-lfs gawk
         
         # Setup toolchain directory structure like build.sh expects
         if [ "${{ steps.cache-proton.outputs.cache-hit }}" != 'true' ]; then
@@ -289,7 +289,7 @@ jobs:
         echo "ANDROID=${ANDROID}" >> $GITHUB_ENV
         echo "AND_VER=${AND_VER}" >> $GITHUB_ENV
 
-    - name: Build Kernel
+    - name: Build Kernel - Anti-Bootloop Method
       run: |
         # Set all variables exactly like build.sh
         export ROOT_DIR=$(pwd)
@@ -340,19 +340,78 @@ jobs:
         echo "LOCALVERSION: ${LOCALVERSION}"
         
         # Make defconfig exactly like build.sh
-        make O=out ARCH=arm64 ANDROID_MAJOR_VERSION=${{ env.ANDROID }} ${{ env.KERNEL_DEFCONFIG }}
+        echo "DEBUG: Making defconfig"
+        make O=out ARCH=arm64 ANDROID_MAJOR_VERSION=${{ env.ANDROID }} ${{ env.KERNEL_DEFCONFIG }} > /dev/null
 
-        # Apply KernelSU configs
-        scripts/config --file out/.config -d LTO -d LTO_CLANG -d CFI_CLANG
-        scripts/config --file out/.config -e KSU -e KSU_DEBUG -e KSU_SU_DEBUG -e KSU_MANUAL_HOOK -e KSU_64BIT
-        scripts/config --file out/.config -e CONFIG_KSU_LSM_SECURITY_HOOKS -e CONFIG_KALLSYMS -e CONFIG_KALLSYMS_ALL
-        scripts/config --file out/.config -d KPROBES -d KPROBE_EVENTS -d KSU_KPROBES_HOOK
-        scripts/config --file out/.config -e MODULE_FORCE_UNLOAD -e MODULE_FORCE_LOAD
+        # CRITICAL: Apply KSU configs exactly like build.sh to prevent bootloop
+        echo "DEBUG: Adding debug configurations for bootloop investigation"
+        if [ -f "out/.config" ]; then
+          # Enable more logging for debugging
+          echo "CONFIG_DYNAMIC_DEBUG=y" >> out/.config
+          echo "CONFIG_PRINTK_TIME=y" >> out/.config
+          echo "CONFIG_LOG_BUF_SHIFT=21" >> out/.config
+          
+          # CRITICAL: Disable CONFIG_KPROBES for manual KernelSU integration (per docs)
+          echo "# CONFIG_KPROBES is not set" >> out/.config
+          echo "# CONFIG_HAVE_KPROBES is not set" >> out/.config
+          echo "# CONFIG_KPROBE_EVENTS is not set" >> out/.config
+          echo "DEBUG: Disabled CONFIG_KPROBES for manual KernelSU integration"
+          
+          # Remove old CONFIG_KSU lines to prevent duplicates
+          sed -i '/^CONFIG_KSU=/d' out/.config
+          sed -i '/^CONFIG_KSU_DEBUG=/d' out/.config
+          sed -i '/^CONFIG_KSU_SU_DEBUG=/d' out/.config
+          sed -i '/^CONFIG_CONFIG_KALLSYMS=/d' out/.config
+          sed -i '/^CONFIG_KALLSYMS_ALL=/d' out/.config
+          
+          # Add or enable new CONFIG_KSU lines EXACTLY like build.sh
+          echo "CONFIG_KSU=y" >> out/.config
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
+          echo "CONFIG_KSU_LSM_SECURITY_HOOKS=y" >> out/.config
+          echo "CONFIG_KSU_DEBUG=y" >> out/.config
+          echo "CONFIG_KSU_SU_DEBUG=y" >> out/.config
+          echo "CONFIG_KSU_64BIT=y" >> out/.config
+          echo "CONFIG_KALLSYMS=y" >> out/.config
+          echo "CONFIG_KALLSYMS_ALL=y" >> out/.config
+          
+          # Ensure Kprobes-related KSU configs are correctly disabled
+          sed -i '/^CONFIG_KSU_KPROBES_HOOK=/d' out/.config
+          echo "# CONFIG_KSU_KPROBES_HOOK is not set" >> out/.config
+
+          # CRITICAL: Disable LTO and CFI for stability (like successful builds)
+          sed -i '/^CONFIG_LTO=/d' out/.config
+          sed -i '/^CONFIG_LTO_CLANG=/d' out/.config
+          sed -i '/^CONFIG_CFI_CLANG=/d' out/.config
+          echo "# CONFIG_LTO is not set" >> out/.config
+          echo "# CONFIG_LTO_CLANG is not set" >> out/.config
+          echo "# CONFIG_CFI_CLANG is not set" >> out/.config
+
+          echo "DEBUG: Verifying critical KernelSU configurations..."
+          if ! grep -q "CONFIG_KSU=y" out/.config; then
+            echo "ERROR: CONFIG_KSU is not set to 'y'! KernelSU will not be built."
+            exit 1
+          fi
+          if ! grep -q "CONFIG_KSU_LSM_SECURITY_HOOKS=y" out/.config; then
+            echo "ERROR: CONFIG_KSU_LSM_SECURITY_HOOKS is not set to 'y'! Manual hooks will not work."
+            exit 1
+          fi
+          if grep -q "CONFIG_KPROBES=y" out/.config; then
+            echo "ERROR: CONFIG_KPROBES is set to 'y', but it should be 'n' for manual hooks!"
+            exit 1
+          fi
+          if grep -q "CONFIG_KSU_KPROBES_HOOK=y" out/.config; then
+            echo "ERROR: CONFIG_KSU_KPROBES_HOOK is set to 'y', but it should be 'n' for manual hooks!"
+            exit 1
+          fi
+          echo "DEBUG: All critical KernelSU configs verified. Continuing build."
+        fi
         
+        # Run olddefconfig to finalize config
         make O=out olddefconfig
         
+        echo "DEBUG: Starting kernel compilation"
         # Build exactly like build.sh
-        PATH="$KERNEL_DIR/toolchain/bin:${PATH}" \
+        PATH="$KERNEL_DIR/toolchain/bin:$KERNEL_DIR/toolchain/bin:${PATH}" \
           make -j$(nproc --all) O=out \
           ARCH=arm64 \
           ANDROID_MAJOR_VERSION=${{ env.ANDROID }} \
@@ -366,14 +425,20 @@ jobs:
         # Copy files exactly like build.sh
         if [ -f "out/arch/arm64/boot/Image" ]; then
           cp -f out/arch/arm64/boot/Image arch/arm64/boot/Image
+          echo "✅ Image copied successfully"
+        else
+          echo "❌ Image build failed!"
+          exit 1
         fi
         
         if [ -f "out/arch/arm64/boot/dtb.img" ]; then
           cp -f out/arch/arm64/boot/dtb.img arch/arm64/boot/dtb.img
+          echo "✅ DTB copied successfully"
         fi
         
         if [ -f "out/arch/arm64/boot/dtbo.img" ]; then
           cp -f out/arch/arm64/boot/dtbo.img arch/arm64/boot/dtbo.img
+          echo "✅ DTBO copied successfully"
         fi
 
     - name: Package kernel
