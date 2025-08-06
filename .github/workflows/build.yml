@@ -405,9 +405,51 @@ jobs:
           fi
           echo "DEBUG: All critical KernelSU configs verified. Continuing build."
         fi
+
+            ######################################################################
+            # ++ FINAL CONFIGURATION VERIFICATION STEP ++
+            ######################################################################
+            echo "✅ Verifying final .config before compilation..."
+            
+            CONFIG_FILE="out/.config"
+            
+            # Check 1: CONFIG_KPROBES MUST BE DISABLED
+            # If "CONFIG_KPROBES=y" is found, the build will fail.
+            if grep -q "CONFIG_KPROBES=y" "$CONFIG_FILE"; then
+              echo "❌ VERIFICATION FAILED: CONFIG_KPROBES is still enabled (CONFIG_KPROBES=y)!"
+              echo "   This is the primary cause of bootloops. Review the 'make olddefconfig' step."
+              # Display related lines for debugging
+              grep 'KPROBES' "$CONFIG_FILE"
+              exit 1
+            else
+              echo "   -> OK: CONFIG_KPROBES is disabled."
+            fi
+            
+            # Check 2: KernelSU and its manual hooks MUST BE ENABLED
+            # If "CONFIG_KSU=y" is not found, the build will fail.
+            if ! grep -q "CONFIG_KSU=y" "$CONFIG_FILE"; then
+              echo "❌ VERIFICATION FAILED: CONFIG_KSU is not enabled!"
+              exit 1
+            else
+              echo "   -> OK: CONFIG_KSU=y is enabled."
+            fi
+            
+            if ! grep -q "CONFIG_KSU_MANUAL_HOOK=y" "$CONFIG_FILE"; then
+              echo "❌ VERIFICATION FAILED: CONFIG_KSU_MANUAL_HOOK is not enabled!"
+              exit 1
+            else
+              echo "   -> OK: CONFIG_KSU_MANUAL_HOOK=y is enabled."
+            fi
+      
+            if ! grep -q "CONFIG_KSU_LSM_SECURITY_HOOKS=y" "$CONFIG_FILE"; then
+              echo "❌ VERIFICATION FAILED: CONFIG_KSU_LSM_SECURITY_HOOKS is not enabled!"
+              exit 1
+            else
+              echo "   -> OK: CONFIG_KSU_LSM_SECURITY_HOOKS=y is enabled."
+            fi
+            
+            echo "✅ All critical configurations verified successfully!"
         
-        # Run olddefconfig to finalize config
-        make O=out olddefconfig
         
         echo "DEBUG: Starting kernel compilation"
         # Build exactly like build.sh
