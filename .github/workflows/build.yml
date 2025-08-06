@@ -67,64 +67,6 @@ jobs:
         ls -la drivers/kernelsu/
         ls -la drivers/kernelsu/Kconfig || echo "Kconfig not found"
 
-
-            - name: Apply Compilation Fix Patches
-          run: |
-        echo "🔧 Applying compilation fix patches..."
-        
-        # Fix 1: Fix include/asm-generic/pgtable.h - Remove extern declarations and fix function definitions
-        if [ -f "include/asm-generic/pgtable.h" ]; then
-          echo "Patching include/asm-generic/pgtable.h..."
-          
-          # Remove the problematic extern lines and fix function implementations
-          sed -i '/^extern unsigned long uksm_zero_pfn __read_mostly;/d' include/asm-generic/pgtable.h
-          sed -i '/^extern unsigned long zero_pfn __read_mostly;/d' include/asm-generic/pgtable.h
-          
-          # Fix the is_uksm_zero_pfn function - remove extern and keep only return statement
-          sed -i '/extern __read_mostly unsigned long uksm_zero_pfn;/d' include/asm-generic/pgtable.h
-          
-          # Fix the my_zero_pfn function - remove extern declaration  
-          sed -i '/extern unsigned long zero_pfn;/d' include/asm-generic/pgtable.h
-          
-          echo "✅ Fixed include/asm-generic/pgtable.h"
-        fi
-        
-        # Fix 2: Fix display brightness calculation in s6d7at0b_a10_lcd_ctrl.c
-        if [ -f "drivers/video/fbdev/exynos/dpu_7885/panels/s6d7at0b_a10_lcd_ctrl.c" ]; then
-          echo "Patching s6d7at0b_a10_lcd_ctrl.c brightness calculation..."
-          
-          # Fix brightness calculation formula
-          sed -i 's/int value = lcd->custom_brightness \* 1\.2;/int value = (lcd->custom_brightness * 12) \/ 10;/g' \
-            drivers/video/fbdev/exynos/dpu_7885/panels/s6d7at0b_a10_lcd_ctrl.c
-            
-          echo "✅ Fixed s6d7at0b_a10_lcd_ctrl.c brightness calculation"
-        fi
-        
-        # Fix 3: Fix decon_clocks_table data type in decon_reg.c
-        if [ -f "drivers/video/fbdev/exynos/dpu_7885/decon_reg.c" ]; then
-          echo "Patching decon_reg.c clock table data type..."
-          
-          # Change from double to long for clock table
-          sed -i 's/const double decon_clocks_table\[\]\[CLK_ID_MAX\]/const long decon_clocks_table[][CLK_ID_MAX]/g' \
-            drivers/video/fbdev/exynos/dpu_7885/decon_reg.c
-            
-          echo "✅ Fixed decon_reg.c clock table data type"
-        fi
-        
-        # Fix 4: Additional potential compilation fixes
-        echo "Applying additional potential fixes..."
-        
-        # Fix any floating point operations that might cause issues in kernel space
-        find drivers/video/fbdev/exynos/dpu_7885/ -name "*.c" -exec sed -i 's/\* 1\.2/ * 12 \/ 10/g' {} \;
-        find drivers/video/fbdev/exynos/dpu_7885/ -name "*.c" -exec sed -i 's/double/long/g' {} \;
-        
-        # Fix potential issues with zero_pfn definitions
-        find . -name "*.c" -exec grep -l "extern.*zero_pfn" {} \; | xargs -r sed -i '/extern.*zero_pfn/d'
-        find . -name "*.h" -exec grep -l "extern.*zero_pfn" {} \; | xargs -r sed -i '/extern.*zero_pfn/d'
-        
-        echo "✅ All compilation fix patches applied successfully!"
-
-
     - name: Cache proton-clang
       uses: actions/cache@v3
       id: cache-proton
@@ -206,6 +148,53 @@ jobs:
         # Run make clean/mrproper here, AFTER all patches have been applied
         make clean
         make mrproper
+
+    - name: Apply Compilation Fix Patches
+      run: |
+        echo "🔧 Applying compilation fix patches..."
+        
+        # Fix 1: include/asm-generic/pgtable.h 
+        if [ -f "include/asm-generic/pgtable.h" ]; then
+          echo "Patching include/asm-generic/pgtable.h..."
+          
+          # Find and add extern declarations before the first static inline function
+          # Add the extern declarations if they don't exist
+          if ! grep -q "extern unsigned long uksm_zero_pfn __read_mostly;" include/asm-generic/pgtable.h; then
+            sed -i '/^#ifdef CONFIG_UKSM$/i\
+          extern unsigned long uksm_zero_pfn __read_mostly;\
+          extern unsigned long zero_pfn __read_mostly;' include/asm-generic/pgtable.h
+          fi
+          
+          # Remove standalone extern lines inside functions (the problematic ones)
+          sed -i '/^\s*extern __read_mostly unsigned long uksm_zero_pfn;$/d' include/asm-generic/pgtable.h
+          sed -i '/^\s*extern unsigned long zero_pfn;$/d' include/asm-generic/pgtable.h
+          
+          echo "✅ Fixed include/asm-generic/pgtable.h"
+        fi
+        
+        # Fix 2: s6d7at0b_a10_lcd_ctrl.c - Fix brightness calculation
+        if [ -f "drivers/video/fbdev/exynos/dpu_7885/panels/s6d7at0b_a10_lcd_ctrl.c" ]; then
+          echo "Patching s6d7at0b_a10_lcd_ctrl.c brightness calculation..."
+          
+          # Replace the specific brightness calculation line
+          sed -i 's/int value = lcd->custom_brightness \* 1\.2;/int value = (lcd->custom_brightness * 12) \/ 10;/' \
+            drivers/video/fbdev/exynos/dpu_7885/panels/s6d7at0b_a10_lcd_ctrl.c
+            
+          echo "✅ Fixed s6d7at0b_a10_lcd_ctrl.c brightness calculation"
+        fi
+        
+        # Fix 3: decon_reg.c - Fix data type from double to long
+        if [ -f "drivers/video/fbdev/exynos/dpu_7885/decon_reg.c" ]; then
+          echo "Patching decon_reg.c data type..."
+          
+          # Replace double with long in decon_clocks_table declaration
+          sed -i 's/const double decon_clocks_table\[\]\[CLK_ID_MAX\]/const long decon_clocks_table[][CLK_ID_MAX]/' \
+            drivers/video/fbdev/exynos/dpu_7885/decon_reg.c
+            
+          echo "✅ Fixed decon_reg.c data type"
+        fi
+        
+        echo "✅ All compilation fix patches applied successfully!"
 
     - name: Configure Android Variant and SELinux
       run: |
@@ -483,6 +472,7 @@ jobs:
         echo "**Features:**" >> $GITHUB_STEP_SUMMARY
         echo "- ✅ KernelSU-Next v1.0.9" >> $GITHUB_STEP_SUMMARY
         echo "- ✅ Scope-minimized hooks" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Compilation fixes applied" >> $GITHUB_STEP_SUMMARY
         if [ "${{ env.ONEUI3 }}" == "1" ]; then
           echo "- ✅ OneUI version" >> $GITHUB_STEP_SUMMARY
         else
