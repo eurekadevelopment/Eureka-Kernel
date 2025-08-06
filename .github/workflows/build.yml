@@ -1,4 +1,4 @@
-name: Build Kernel - Anti-Bootloop
+name: Build Kernel
 
 on:
   workflow_dispatch:
