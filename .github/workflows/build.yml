@@ -515,7 +515,7 @@ jobs:
           echo "✅ DTBO copied successfully"
         fi
 
-    - name: Package kernel
+    - name: Package AnyKernel3 Zip
       run: |
         cd kernel_zip/anykernel/
         echo "Packaging and preparing for upload..."
@@ -529,7 +529,7 @@ jobs:
           ZIPNAME="Eureka_R${REV}_${{ env.CODENAME }}_${{ github.event.inputs.selinux_mode }}_Legacy_QRS_KSUN.zip"
         fi
         
-        # Copy built kernel artifacts exactly like build.sh ZIPPIFY function
+        # Copy built kernel artifacts
         if [ -f "../../arch/arm64/boot/Image" ]; then
           cp -f ../../arch/arm64/boot/Image Image
           echo "✅ Copied Image"
@@ -541,7 +541,6 @@ jobs:
         # Copy DTB if it exists
         if [ -f "../../arch/arm64/boot/dtb.img" ]; then
           if [ "${{ env.CODENAME }}" == "A3050" ] || [ "${{ env.CODENAME }}" == "M205" ]; then
-            # Don't copy dtb to anykernel directory for these devices (like build.sh)
             cp -f ../../arch/arm64/boot/dtb.img ../${{ env.CODENAME }}_dtb.img
           else
             cp -f ../../arch/arm64/boot/dtb.img dtb.img
@@ -549,7 +548,7 @@ jobs:
           fi
         fi
         
-        # Use prebuilt DTBO like build.sh PREBUILT_DTBO function
+        # Use prebuilt DTBO
         case "${{ env.CODENAME }}" in
           "A105") cp -f ../dtbo/a10/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied A10 DTBO" || echo "⚠️ A10 DTBO not found" ;;
           "A205") cp -f ../dtbo/a20/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied A20 DTBO" || echo "⚠️ A20 DTBO not found" ;;
@@ -560,80 +559,54 @@ jobs:
           "A3050") cp -f ../dtbo/a3050/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied A40S DTBO" || echo "⚠️ A40S DTBO not found" ;;
           "M205") cp -f ../dtbo/m20/dtbo.img dtbo.img 2>/dev/null && echo "✅ Copied M20 DTBO" || echo "⚠️ M20 DTBO not found" ;;
         esac
-
-        # Create zip exactly like build.sh ZIPPIFY function
-        if [ -e "dtb.img" ]; then
-          if [ -e "dtbo.img" ]; then
+        
+        # Create zip
+        if [ -e "dtb.img" ] && [ -e "dtbo.img" ]; then
             zip -r9 $ZIPNAME META-INF tools anykernel.sh Image dtb.img dtbo.img version > /dev/null
             echo "✅ Created zip with Image + DTB + DTBO"
-          else
+        elif [ -e "dtb.img" ]; then
             mv anykernel.sh anykernel.sh.bak
             sed '58,61d' anykernel.sh.bak > anykernel.sh
             zip -r9 $ZIPNAME META-INF tools anykernel.sh Image dtb.img version > /dev/null
-            rm -f anykernel.sh
-            mv anykernel.sh.bak anykernel.sh
-            chmod a+x anykernel.sh
+            rm -f anykernel.sh; mv anykernel.sh.bak anykernel.sh; chmod a+x anykernel.sh
             echo "✅ Created zip with Image + DTB (no DTBO)"
-          fi
         else
-          mv anykernel.sh anykernel.sh.bak
-          sed '53,61d' anykernel.sh.bak > anykernel.sh
-          zip -r9 $ZIPNAME META-INF tools anykernel.sh Image version > /dev/null
-          rm -f anykernel.sh
-          mv anykernel.sh.bak anykernel.sh
-          echo "✅ Created zip with Image only"
+            mv anykernel.sh anykernel.sh.bak
+            sed '53,61d' anykernel.sh.bak > anykernel.sh
+            zip -r9 $ZIPNAME META-INF tools anykernel.sh Image version > /dev/null
+            rm -f anykernel.sh; mv anykernel.sh.bak anykernel.sh
+            echo "✅ Created zip with Image only"
         fi
         
         chmod 0777 $ZIPNAME
         echo "ZIPNAME=${ZIPNAME}" >> $GITHUB_ENV
-        
-        # Go back to the root directory
         cd ../../
 
-        - name: Create boot.img using AIK
-        run: |
+    - name: Create boot.img using AIK
+      run: |
         echo "✅ Creating a full boot.img by replacing the kernel..."
-        
-        # 1. Download the Android Image Kitchen (AIK) tool for Linux
         git clone --depth=1 https://github.com/SebaUbuntu/AIK-Linux-mirror AIK-Linux
         
-        # 2. Check for and unzip the stock boot image from the zip archive
         STOCK_BOOT_ZIP="prebuilt/boot.img.zip"
         if [ ! -f "$STOCK_BOOT_ZIP" ]; then
-          echo "❌ Stock boot image zip not found at '$STOCK_BOOT_ZIP'. Skipping boot.img creation."
+          echo "❌ Stock boot image zip not found. Skipping boot.img creation."
           exit 0
         fi
 
-        echo "   -> Unzipping stock boot image from $STOCK_BOOT_ZIP..."
-        unzip "$STOCK_BOOT_ZIP" # This extracts boot.img to the workspace root directory
-
-        # 3. Verify that the boot.img was successfully extracted
+        unzip "$STOCK_BOOT_ZIP"
+        
         STOCK_BOOT_IMAGE="boot.img"
         if [ ! -f "$STOCK_BOOT_IMAGE" ]; then
-          echo "❌ Failed to unzip or boot.img was not found inside the zip archive."
+          echo "❌ Failed to unzip or boot.img was not found in the zip archive."
           exit 1
         fi
 
-        # 4. Copy the (now unzipped) boot.img to AIK for processing
         cp "$STOCK_BOOT_IMAGE" AIK-Linux/boot.img
         cd AIK-Linux
-        echo "   -> Unpacking stock boot.img..."
         ./unpackimg.sh
-        
-        # 5. Replace the old kernel with the new one you just built
-        echo "   -> Replacing kernel..."
         cp ../arch/arm64/boot/Image split_img/boot.img-kernel
-        
-        # 6. Repack to create the new boot.img
-        echo "   -> Repacking new boot.img..."
         ./repackimg.sh
         
-        # 7. List the generated files for verification
-        echo "--- Generated files in AIK directory: ---"
-        ls -l
-        echo "-----------------------------------------"
-
-        # 8. Dynamically set the output filename based on the build variant
         FINAL_BOOT_FILENAME=""
         if [ "${{ env.ONEUI3 }}" == "1" ]; then
           FINAL_BOOT_FILENAME="ksun-oneui.img"
@@ -641,24 +614,19 @@ jobs:
           FINAL_BOOT_FILENAME="ksun-aosp.img"
         fi
         
-        # 9. Move the new boot.img and rename it using the dynamic name
-        echo "   -> Moving 'image-new.img' to the root directory as '${FINAL_BOOT_FILENAME}'"
         mv image-new.img "../${FINAL_BOOT_FILENAME}"
-        
-        # 10. Export the final filename for the upload step
         echo "BOOT_IMG_FILENAME=${FINAL_BOOT_FILENAME}" >> $GITHUB_ENV
-        
         cd ..
         echo "✅ Successfully created ${FINAL_BOOT_FILENAME}"
 
-        - name: Upload Kernel Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ANDROID_VAR }}-${{ env.CODENAME }}-${{ github.event.inputs.selinux_mode }}-R${{ github.run_number }}
-          path: |
-            kernel_zip/anykernel/*.zip
-            ${{ env.BOOT_IMG_FILENAME }} # <-- Use the variable here instead of a fixed name
-          if-no-files-found: error
+    - name: Upload Kernel Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ANDROID_VAR }}-${{ env.CODENAME }}-${{ github.event.inputs.selinux_mode }}-R${{ github.run_number }}
+        path: |
+          kernel_zip/anykernel/*.zip
+          ${{ env.BOOT_IMG_FILENAME }}
+        if-no-files-found: error
 
     - name: Generate Build Summary
       run: |
