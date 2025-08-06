@@ -590,12 +590,65 @@ jobs:
         # Go back to the root directory
         cd ../../
 
-    - name: Upload kernel to artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ env.ANDROID_VAR }}-${{ env.CODENAME }}-${{ github.event.inputs.selinux_mode }}-R${{ github.run_number }}
-        path: kernel_zip/anykernel/*.zip
-        if-no-files-found: error
+        - name: Create boot.img using AIK
+        run: |
+        echo "✅ Creating a full boot.img by replacing the kernel..."
+        
+        # 1. Download the Android Image Kitchen (AIK) tool for Linux
+        git clone --depth=1 https://github.com/SebaUbuntu/AIK-Linux-mirror AIK-Linux
+        
+        # 2. Define the path to the stock boot.img file
+        STOCK_BOOT_IMAGE="prebuilt/boot.img"
+        if [ ! -f "$STOCK_BOOT_IMAGE" ]; then
+          echo "❌ Stock boot image not found at '$STOCK_BOOT_IMAGE'. Skipping boot.img creation."
+          exit 0
+        fi
+
+        # 3. Copy and unpack the stock boot.img using AIK
+        cp "$STOCK_BOOT_IMAGE" AIK-Linux/boot.img
+        cd AIK-Linux
+        echo "   -> Unpacking stock boot.img..."
+        ./unpackimg.sh
+        
+        # 4. Replace the old kernel with the new one you just built
+        echo "   -> Replacing kernel..."
+        cp ../arch/arm64/boot/Image split_img/boot.img-kernel
+        
+        # 5. Repack to create the new boot.img
+        echo "   -> Repacking new boot.img..."
+        ./repackimg.sh
+        
+        # 6. List the generated files for verification
+        echo "--- Generated files in AIK directory: ---"
+        ls -l
+        echo "-----------------------------------------"
+
+        # 7. Dynamically set the output filename based on the build variant
+        FINAL_BOOT_FILENAME=""
+        if [ "${{ env.ONEUI3 }}" == "1" ]; then
+          FINAL_BOOT_FILENAME="ksun-oneui.img"
+        else
+          FINAL_BOOT_FILENAME="ksun-aosp.img"
+        fi
+        
+        # 8. Move the new boot.img and rename it using the dynamic name
+        echo "   -> Moving 'image-new.img' to the root directory as '${FINAL_BOOT_FILENAME}'"
+        mv image-new.img "../${FINAL_BOOT_FILENAME}"
+        
+        # 9. Export the final filename for the upload step
+        echo "BOOT_IMG_FILENAME=${FINAL_BOOT_FILENAME}" >> $GITHUB_ENV
+        
+        cd ..
+        echo "✅ Successfully created ${FINAL_BOOT_FILENAME}"
+
+        - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ANDROID_VAR }}-${{ env.CODENAME }}-${{ github.event.inputs.selinux_mode }}-R${{ github.run_number }}
+          path: |
+            kernel_zip/anykernel/*.zip
+            ${{ env.BOOT_IMG_FILENAME }} # <-- Use the variable here instead of a fixed name
+          if-no-files-found: error
 
     - name: Generate Build Summary
       run: |
