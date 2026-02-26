@@ -1,0 +1,208 @@
+name: Build Eureka R15-OneUI + BPF merge from R24U
+
+on:
+  workflow_dispatch:
+    inputs:
+      merge_method:
+        description: 'Merge method: "merge" (full branch) or "cherry-pick" (specific commits – you must edit the script)'
+        required: true
+        default: 'merge'
+        type: choice
+        options:
+          - merge
+          - cherry-pick
+  push:
+    branches: [ R15-OneUI ]   # trigger on pushes to R15-OneUI as well
+
+env:
+  KERNEL_BRANCH: R15-OneUI
+  MERGE_FROM_BRANCH: R24U
+  MERGE_SOURCE: origin/R24U
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      # Telegram notification: build started
+      - name: Send build started notification
+        uses: cbrgm/telegram-github-action@v1
+        if: always() && secrets.TELEGRAM_TOKEN && secrets.TELEGRAM_CHAT_ID
+        with:
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          message: |
+            🏗️ **Build Started: Eureka R15-OneUI + BPF merge**
+            **Base branch:** ${{ env.KERNEL_BRANCH }}
+            **Merge from:** ${{ env.MERGE_FROM_BRANCH }}
+            **Commit:** ${{ github.sha }}
+            **Actor:** ${{ github.actor }}
+            [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          parse-mode: markdown
+
+      # 1. Checkout kernel source (R15-OneUI branch)
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KERNEL_BRANCH }}
+          path: kernel
+          fetch-depth: 0   # need full history for merge
+
+      # 2. Merge BPF changes from R24U
+      - name: Merge BPF changes
+        working-directory: ./kernel
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          # Add the remote (if not already present)
+          git remote add upstream https://github.com/${{ github.repository }}.git || true
+          git fetch upstream ${{ env.MERGE_FROM_BRANCH }}
+
+          if [[ "${{ github.event.inputs.merge_method }}" == "merge" ]]; then
+            echo "Merging full branch ${{ env.MERGE_FROM_BRANCH }} into ${{ env.KERNEL_BRANCH }}"
+            git merge --no-ff upstream/${{ env.MERGE_FROM_BRANCH }} -m "Merge ${{ env.MERGE_FROM_BRANCH }} for BPF support"
+          else
+            echo "Cherry-pick mode selected – you need to edit this step with specific commit hashes."
+            echo "Example: git cherry-pick <commit1> <commit2> ..."
+            # Uncomment and replace with actual commits:
+            # git cherry-pick abc123 def456
+            exit 1   # fail until you define the commits
+          fi
+
+      # 3. Add KernelSU-Next submodule (v1.1.1)
+      - name: Add KernelSU-Next submodule
+        working-directory: ./kernel
+        run: |
+          git submodule add https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+          cd KernelSU-Next
+          git fetch --tags
+          git checkout v1.1.1
+          cd ..
+
+      # 4. Run KernelSU-Next setup
+      - name: Run KernelSU-Next setup
+        working-directory: ./kernel
+        run: |
+          chmod +x KernelSU-Next/kernel/setup.sh
+          ./KernelSU-Next/kernel/setup.sh
+
+      # 5. Enable KernelSU in defconfig
+      - name: Enable KernelSU-Next in defconfig
+        working-directory: ./kernel
+        run: |
+          echo "# KernelSU-Next" >> arch/arm64/configs/exynos7885-a30_defconfig
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/exynos7885-a30_defconfig
+          echo "CONFIG_KSU_WITH_KPROBES=n" >> arch/arm64/configs/exynos7885-a30_defconfig
+          echo "# CONFIG_KSU_DEBUG is not set" >> arch/arm64/configs/exynos7885-a30_defconfig
+          tail -10 arch/arm64/configs/exynos7885-a30_defconfig
+
+      # 6. Install dependencies
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y bc bison flex libssl-dev make git python3 cpio \
+                              gcc-aarch64-linux-gnu
+
+      # 7. Setup Neutron Clang toolchain
+      - name: Setup Neutron Clang toolchain
+        run: |
+          mkdir -p toolchain
+          cd toolchain
+          bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") -S=10032024
+          bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") --patch=glibc
+          cd ..
+          echo "$(pwd)/toolchain/bin" >> $GITHUB_PATH
+
+      # 8. Environment variables
+      - name: Set up environment variables
+        run: |
+          clang --version
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "AR=llvm-ar" >> $GITHUB_ENV
+          echo "NM=llvm-nm" >> $GITHUB_ENV
+          echo "OBJCOPY=llvm-objcopy" >> $GITHUB_ENV
+          echo "OBJDUMP=llvm-objdump" >> $GITHUB_ENV
+          echo "STRIP=llvm-strip" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "ARCH=arm64" >> $GITHUB_ENV
+
+      # 9. Configure kernel
+      - name: Configure kernel
+        working-directory: ./kernel
+        run: |
+          make O=out ARCH=arm64 exynos7885-a30_defconfig
+
+      # 10. Verify KernelSU config
+      - name: Verify KernelSU config
+        working-directory: ./kernel
+        run: |
+          grep -q "CONFIG_KSU=y" out/.config || (echo "KernelSU not enabled!" && exit 1)
+
+      # 11. Build kernel (capture log)
+      - name: Build kernel
+        working-directory: ./kernel
+        run: |
+          make -j$(nproc) O=out ARCH=arm64 \
+            CC=${CC} LD=${LD} AR=${AR} NM=${NM} \
+            OBJCOPY=${OBJCOPY} OBJDUMP=${OBJDUMP} STRIP=${STRIP} \
+            CROSS_COMPILE=${CROSS_COMPILE} 2>&1 | tee build.log
+
+      # 12. Upload build log to Telegram
+      - name: Upload build log to Telegram
+        if: always() && secrets.TELEGRAM_TOKEN && secrets.TELEGRAM_CHAT_ID
+        uses: akshaybabloo/telegram-upload@v1.0.0
+        with:
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          file: kernel/build.log
+          caption: |
+            📄 **Build Log** – Eureka R15-OneUI + BPF
+            Status: ${{ job.status }}
+            Commit: ${{ github.sha }}
+
+      # 13. Checkout AnyKernel3
+      - name: Checkout AnyKernel3
+        uses: actions/checkout@v4
+        with:
+          repository: osm0sis/AnyKernel3
+          path: anykernel
+
+      # 14. Copy kernel image
+      - name: Copy kernel image to AnyKernel3
+        run: |
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb anykernel/ || \
+          cp kernel/out/arch/arm64/boot/Image.gz anykernel/ || \
+          cp kernel/out/arch/arm64/boot/Image anykernel/
+          if [ -f kernel/out/arch/arm64/boot/dtb.img ]; then
+            cp kernel/out/arch/arm64/boot/dtb.img anykernel/;
+          fi
+
+      # 15. Create flashable zip
+      - name: Create flashable zip
+        run: |
+          cd anykernel
+          zip -r9 ../Eureka_R15-OneUI_KSU.zip * -x .git README.md *placeholder
+          cd ..
+
+      # 16. Upload artifact
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eureka_R15-OneUI_KSU
+          path: Eureka_R15-OneUI_KSU.zip
+
+      # 17. Final Telegram notification
+      - name: Send build completion notification
+        if: always() && secrets.TELEGRAM_TOKEN && secrets.TELEGRAM_CHAT_ID
+        uses: cbrgm/telegram-github-action@v1
+        with:
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          message: |
+            ${{ job.status == 'success' && '✅ **Build Successful!**' || '❌ **Build Failed!**' }}
+            **Kernel:** Eureka R15-OneUI + BPF merge
+            **Status:** ${{ job.status }}
+            [View logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          parse-mode: markdown
