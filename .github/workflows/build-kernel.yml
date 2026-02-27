@@ -1,0 +1,88 @@
+name: Build Kernel (from any branch) + AnyKernel3
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build (e.g., R15-OneUI-bpf-merged-*)'
+        required: true
+        default: 'R15-OneUI-bpf-merged-20260227-121540-cf7baeaf'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout specified branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Setup ReSukiSU (KernelSU)
+        working-directory: ./kernel
+        run: curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y bc bison flex libssl-dev make git python3 cpio gcc-aarch64-linux-gnu zip
+
+      - name: Setup Neutron Clang
+        run: |
+          mkdir -p toolchain
+          cd toolchain
+          bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") -S=10032024
+          bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") --patch=glibc
+          echo "$(pwd)/bin" >> $GITHUB_PATH
+
+      - name: Set environment
+        run: |
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "AR=llvm-ar" >> $GITHUB_ENV
+          echo "NM=llvm-nm" >> $GITHUB_ENV
+          echo "OBJCOPY=llvm-objcopy" >> $GITHUB_ENV
+          echo "OBJDUMP=llvm-objdump" >> $GITHUB_ENV
+          echo "STRIP=llvm-strip" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "ARCH=arm64" >> $GITHUB_ENV
+
+      - name: Configure kernel
+        working-directory: ./kernel
+        run: make O=out ARCH=arm64 exynos7885-a30_defconfig
+
+      - name: Enable KernelSU
+        working-directory: ./kernel
+        run: |
+          ./scripts/config --file out/.config --enable CONFIG_KSU
+          make O=out olddefconfig
+
+      - name: Build kernel
+        working-directory: ./kernel
+        run: make O=out -j$(nproc) ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu-
+
+      # ------------------- AnyKernel3 Packaging -------------------
+      - name: Clone AnyKernel3
+        run: git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+
+      - name: Copy kernel image to AnyKernel3
+        run: cp kernel/out/arch/arm64/boot/Image anykernel/  # adjust if your image name/path differs
+
+      - name: Generate random zip name
+        id: zipname
+        run: |
+          timestamp=$(date +%Y%m%d-%H%M%S)
+          random=$(openssl rand -hex 4)
+          echo "ZIP_NAME=kernel-${{ github.event.inputs.branch }}-${timestamp}-${random}" >> $GITHUB_OUTPUT
+
+      - name: Create flashable zip
+        working-directory: ./anykernel
+        run: |
+          zip -r9 "../${{ steps.zipname.outputs.ZIP_NAME }}.zip" * -x "*.git*"
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.zipname.outputs.ZIP_NAME }}
+          path: ${{ steps.zipname.outputs.ZIP_NAME }}.zip
