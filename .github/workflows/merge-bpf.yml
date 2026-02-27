@@ -1,0 +1,101 @@
+name: Merge BPF files from R24U into R15-OneUI
+
+on:
+  workflow_dispatch:          # allows manual trigger
+  push:
+    branches: [ R15-OneUI ]   # auto‑run when R15-OneUI is updated
+
+env:
+  KERNEL_BRANCH: R15-OneUI
+  MERGE_FROM_BRANCH: R24U
+  NEW_BRANCH_PREFIX: R15-OneUI-bpf-merged
+
+jobs:
+  merge-bpf:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout kernel source (${{ env.KERNEL_BRANCH }})
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KERNEL_BRANCH }}
+          path: kernel
+          fetch-depth: 0          # full history needed for git operations
+
+      - name: Set Git user
+        working-directory: ./kernel
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      # ------------------- Purge KernelSU (optional) -------------------
+      - name: Purge KernelSU (if present)
+        working-directory: ./kernel
+        run: |
+          if [ -e "KernelSU" ]; then
+            git rm -rf KernelSU
+          fi
+          if [ -f ".gitmodules" ] && grep -q 'submodule "KernelSU"' .gitmodules; then
+            git config --file .gitmodules --remove-section submodule.KernelSU 2>/dev/null || true
+            git add .gitmodules
+          fi
+          git add -A
+          git commit -m "Purge KernelSU before merge" || echo "No changes to commit"
+
+      # ------------------- Fetch R24U branch ---------------------------
+      - name: Add upstream remote and fetch R24U
+        working-directory: ./kernel
+        run: |
+          git remote add upstream https://github.com/${{ github.repository }}.git || true
+          git fetch upstream ${{ env.MERGE_FROM_BRANCH }}
+
+      # ------------------- Identify and merge BPF files ----------------
+      - name: Extract BPF files from R24U and apply to working tree
+        working-directory: ./kernel
+        run: |
+          # List all files in R24U, filter those containing "bpf" (case‑insensitive)
+          # Adjust the grep pattern if needed (e.g., add more keywords)
+          bpf_files=$(git ls-tree -r upstream/${{ env.MERGE_FROM_BRANCH }} --name-only | grep -i bpf || true)
+
+          if [ -z "$bpf_files" ]; then
+            echo "No BPF files found in ${{ env.MERGE_FROM_BRANCH }}. Exiting."
+            exit 0
+          fi
+
+          echo "Found BPF files:"
+          echo "$bpf_files"
+
+          # For each BPF file, check it out from R24U into the working tree
+          # This will add new files and overwrite existing ones
+          echo "$bpf_files" | while read -r file; do
+            git checkout upstream/${{ env.MERGE_FROM_BRANCH }} -- "$file" 2>/dev/null || echo "Warning: could not checkout $file"
+          done
+
+          # Stage all changes (adds, modifications, but NOT deletions)
+          git add -A
+
+          # Commit the merge
+          if ! git diff --cached --quiet; then
+            git commit -m "Merge BPF files from ${{ env.MERGE_FROM_BRANCH }}"
+            echo "BPF files merged successfully."
+          else
+            echo "No BPF file changes to commit."
+          fi
+
+      # ------------------- Create and push a new branch ----------------
+      - name: Create new branch with merged BPF files
+        working-directory: ./kernel
+        run: |
+          # Generate a unique branch name with timestamp
+          timestamp=$(date +%Y%m%d-%H%M%S)
+          new_branch="${{ env.NEW_BRANCH_PREFIX }}-${timestamp}"
+
+          git checkout -b "$new_branch"
+          git push origin "$new_branch"
+
+          echo "NEW_BRANCH=$new_branch" >> $GITHUB_ENV
+
+      - name: Output new branch name
+        run: |
+          echo "✅ New branch created: ${{ env.NEW_BRANCH }}"
+          echo "You can now check it out locally or trigger a build from it."
